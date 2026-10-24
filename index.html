@@ -258,4 +258,51 @@ function drawQueue(){const w=Store.getWork(),v=document.getElementById('vQ');
   ${f(c.Fresh)}Fresh leads ${f(c.Callback+c.Overdue)}Callbacks due ${f(c.Retry)}Retries due ${f(tod.length)}Calls today ${f(sold)}Sales pending app
   
    ${sub}
-   <div id
+   <div id="panel">${pd?pdBar():''} Call
+    
+     
+    <input type="text" id="note" placeholder="Optional note, saved word for word">
+    
+   ${filt}
+   Type Name Phone State ${qv==='retry'?'Last attempt':'Last result'} Calls ${body}
+  
+   ${pd?'':(()=>{const L=pdList(now),cand=R.filter(r=>PDORDER.includes(r.tag)).length;
+     return ` Power dial LEO calls your queue in order: overdue callbacks, due callbacks, fresh leads, then retries. Log each call and the next one comes up.
+     ${f(L.length)}ready to dial now
+     ${cand>L.length?` ${f(cand-L.length)} skipped for now: outside 8am–9pm their time. `:''}
+     
+     `})()}
+   ${overdue.length?` Overdue callbacks Promised and missed. They sit at the top of the queue. ${overdue.map(r=>` ${esc(r.name||r.phone)}${fmtWhen(r.cb)} `).join('')} `:''}
+   Upcoming callbacks They move to the top of the queue when their time comes. ${upcoming.map(r=>` ${esc(r.name||r.phone)}${r.why?' · '+esc(r.why)+'':''}${fmtWhen(r.cb)} `).join('')||' None scheduled'}
+   Today on this sheet Calls logged today ${Object.entries(by).sort((a,b)=>b[1]-a[1]).map(([k,n])=>` ${nice(k)}${n} `).join('')||' No calls logged yet'}
+   `;
+  if(sel){const r=R.find(x=>x.key===sel);if(r)showPanel(r)}}
+function rowHTML(r,col){return ` ${r.tag==='Callback'?'Due now':r.tag==='Retry'?'Retry now':r.tag} ${esc(r.name)||'No name'} ${esc(r.phone)} ${esc(r.state)||'—'} ${col(r)} ${r.att} `}
+function showPanel(r){const p=document.getElementById('panel');if(!p)return;p.style.display='block';
+  document.getElementById('pName').textContent=r.name||'No name on file';
+  document.getElementById('pMeta').textContent=`${r.phone} · ${r.state||'state unknown'} · ${r.att} call(s) · last: ${nice(r.last)}${r.cb?' · callback '+fmtWhen(r.cb):''}${r.due&&r.tag==='Waiting'?' · due '+fmtDay(r.due):''}`;
+  document.getElementById('cbLabel').textContent=r.cb?'Reschedule this callback. The original time stays in their history.':'When should LEO bring this callback back?';
+  const bk=document.getElementById('pBack');if(bk)bk.style.display=canSendBack(r)?'':'none';
+  const c=document.getElementById('pCall');if(c){c.href='tel:'+telNum(r.phone);c.textContent='Call '+r.phone}
+  const h=document.getElementById('pHours');if(h){const t=theirTime(r.state);
+    h.textContent=t?(t.ok?'Their time: '+t.label:'Outside calling hours: it is '+t.label+' for them. Best to wait.'):'';
+    h.style.color=t&&t.ok?'var(--mute)':''}}
+function openPanel(k){sel=k;drawQueue();const p=document.getElementById('panel');if(p)p.scrollIntoView({behavior:'smooth',block:'nearest'})}
+function closePanel(){sel=null;pd=false;drawQueue()}
+function record(code,cbAt,why){const w=Store.getWork();const l=w&&w.leads.find(x=>x.key===sel);if(!l)return;
+  const nEl=document.getElementById('note'),note=nEl?(nEl.value||'').trim():'';
+  const saved=Store.addAttempt({attempt_uid:'web-'+uid(),sheet_uid:w.uid,lead_key:l.key,lead_id:l.db_id??null,phone:l.phone,standard_outcome:code,original_text:note,callback_at:cbAt||null,callback_reason:why||'',logged_at:new Date().toISOString(),source:'dashboard',schema_version:4});
+  if(!saved){alert('Your browser is out of storage, so this call was NOT saved.\n\nOpen the Database tab, download a full backup, then remove an older archived sheet. Then log the call again.');return}
+  sync(()=>Cloud.pushAttempt(saved));
+  const msg='Logged: '+(l.name||l.phone)+' · '+nice(code)+(cbAt?' · '+fmtWhen(cbAt):'');
+  if(code==='DO_NOT_CALL')toast(msg);else toast(msg,`sendBack('${l.key}')`);if(!pdAdvance(l.key)){sel=null;drawQueue()}}
+function logCall(code){
+  if(code==='CALLBACK'){const b=document.getElementById('cbBox'),d=new Date();d.setDate(d.getDate()+1);d.setHours(10,0,0,0);
+    document.getElementById('cbAt').value=localInput(d);document.getElementById('cbWhy').value='';b.style.display='block';
+    document.getElementById('cbAt').focus();return}
+  record(code,null,'')}
+function saveCallback(){const v=document.getElementById('cbAt').value;if(!v){alert('Pick a date and time for the callback.');return}
+  record('CALLBACK',new Date(v).toISOString(),(document.getElementById('cbWhy').value||'').trim())}
+function markDNC(){const w=Store.getWork();const l=w&&w.leads.find(x=>x.key===sel);if(!l)return;
+  if(!confirm(`Mark ${l.name||l.phone} as do not call? They leave every calling list for good.`))return;
+  record('DO_NOT_CALL',null,'')}

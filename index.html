@@ -1,0 +1,261 @@
+<!DOCTYPE html><html lang="en"><body>
+
+
+
+<input type="file" id="file" accept=".csv,.xlsx,.xls" style="display:none" onchange="importFile(this.files[0]);this.value=''">
+<input type="file" id="bfile" accept=".json,application/json" style="display:none" onchange="restoreBackup(this.files[0]);this.value=''">
+
+<script>
+const f=n=>Number(n).toLocaleString();
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+/* ===== STORAGE LAYER — the only code that touches storage.
+   Next phase (Supabase): swap these bodies for API calls. Shapes stay the same.
+   Every write returns true or false; callers must check before clearing anything. ===== */
+const Store={mode:'this browser',
+  _g(k,d){try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return d}},
+  _s(k,v){try{localStorage.setItem(k,JSON.stringify(v));return true}catch(e){return false}},
+  getWork(){return this._g('leo_working_sheet_v1',null)},
+  setWork(w){if(!w){localStorage.removeItem('leo_working_sheet_v1');return true}return this._s('leo_working_sheet_v1',w)},
+  attempts(){return this._g('leo_contact_attempts_v1',[])},
+  addAttempt(a){const x=this.attempts();x.push(a);return this._s('leo_contact_attempts_v1',x)?a:null},
+  archives(){return this._g('leo_archives_v1',[])},
+  setArchives(x){return this._s('leo_archives_v1',x)},
+  addArchive(r){const x=this.archives();x.push(r);return this._s('leo_archives_v1',x)},
+  bytes(){let n=0;try{['leo_working_sheet_v1','leo_contact_attempts_v1','leo_archives_v1'].forEach(k=>{const v=localStorage.getItem(k);if(v)n+=v.length})}catch(e){}return n},
+  backup(){return {leo_backup:6,exported_at:new Date().toISOString(),working_sheet:this.getWork(),attempts:this.attempts(),archives:this.archives()}},
+  restore(b){if(!b||typeof b!=='object'||!Array.isArray(b.attempts)||!Array.isArray(b.archives))return 'That file is not a LEO backup.';
+    const keep={w:this.getWork(),a:this.attempts(),r:this.archives()};
+    if(this._s('leo_contact_attempts_v1',b.attempts)&&this._s('leo_archives_v1',b.archives)&&this.setWork(b.working_sheet||null))return '';
+    this._s('leo_contact_attempts_v1',keep.a);this._s('leo_archives_v1',keep.r);this.setWork(keep.w);
+    return 'That backup is too big for this browser. Nothing was changed.'}};
+
+/* ===== CLOUD — a Supabase mirror of the local store =====
+   localStorage stays the source of truth, so LEO keeps working with no internet
+   and every out-of-storage protection from v6 still applies. Each successful
+   local write is mirrored up. A failed sync never loses anything locally. */
+const SB_URL='https://hlrgpqcyatclrumaogih.supabase.co';
+const SB_KEY='sb_publishable_sxTDDS6NKCEx7z0AutlbwQ_gEYyFUr_';
+const Cloud={
+  client:null,user:null,state:'off',note:'',ids:{},
+  on(){return !!(this.client&&this.user)},
+  start(){if(this.client||!window.supabase)return !!this.client;
+    try{this.client=window.supabase.createClient(SB_URL,SB_KEY)}catch(e){this.client=null}
+    return !!this.client},
+  async session(){if(!this.start())return null;
+    try{const r=await this.client.auth.getSession();this.user=r&&r.data&&r.data.session?r.data.session.user:null}
+    catch(e){this.user=null}
+    this.state=this.user?'synced':'off';return this.user},
+  async signIn(email,pw){const {data,error}=await this.client.auth.signInWithPassword({email,password:pw});
+    if(error)throw error;this.user=data.user;this.state='synced';return this.user},
+  async signUp(email,pw){const {data,error}=await this.client.auth.signUp({email,password:pw});
+    if(error)throw error;this.user=data.user||null;if(this.user)this.state='synced';return this.user},
+  async signOut(){try{await this.client.auth.signOut()}catch(e){}this.user=null;this.ids={};this.state='off';this.note=''},
+  async sheetId(w,status){
+    const {data,error}=await this.client.from('sheets').upsert({
+      agent_id:this.user.id,sheet_uid:w.uid||w.sheet_uid,name:w.name,origin:w.origin||'file',status,
+      created:w.created||new Date().toISOString(),
+      archived_at:status==='archived'?(w.archived_at||new Date().toISOString()):null
+    },{onConflict:'agent_id,sheet_uid'}).select('id').single();
+    if(error)throw error;this.ids[w.uid||w.sheet_uid]=data.id;return data.id},
+  async putLeads(id,leads){
+    const rows=(leads||[]).map(l=>({agent_id:this.user.id,sheet_id:id,lead_key:l.key,db_id:l.db_id??null,
+      name:l.name||null,phone:l.phone||null,state:l.state||null,email:l.email||null,
+      prev_outcome:l.prev_outcome||null,prev_att:l.prev_att||0,info:l.info||{}}));
+    for(let i=0;i<rows.length;i+=400){
+      const {error}=await this.client.from('leads').upsert(rows.slice(i,i+400),{onConflict:'sheet_id,lead_key'});
+      if(error)throw error}},
+  async putAttempts(id,list){
+    const rows=(list||[]).map(a=>({agent_id:this.user.id,sheet_id:id,attempt_uid:a.attempt_uid,lead_key:a.lead_key,
+      db_lead_id:a.lead_id??null,phone:a.phone||null,standard_outcome:a.standard_outcome,
+      original_text:a.original_text||'',callback_at:a.callback_at||null,callback_reason:a.callback_reason||'',
+      logged_at:a.logged_at,source:a.source||'dashboard',schema_version:a.schema_version||4}));
+    for(let i=0;i<rows.length;i+=400){
+      const {error}=await this.client.from('contact_attempts').upsert(rows.slice(i,i+400),{onConflict:'agent_id,attempt_uid'});
+      if(error)throw error}},
+  async pushWork(){const w=Store.getWork();if(!w)return;
+    const id=await this.sheetId(w,'working');await this.putLeads(id,w.leads);
+    await this.putAttempts(id,Store.attempts().filter(a=>a.sheet_uid===w.uid))},
+  async pushAttempt(a){const w=Store.getWork();if(!w)return;
+    const id=this.ids[w.uid]||await this.sheetId(w,'working');
+    await this.putAttempts(id,[a]);
+    if(a.standard_outcome==='DO_NOT_CALL'&&a.phone){
+      const {error}=await this.client.from('do_not_call')
+        .upsert({agent_id:this.user.id,phone:a.phone,reason:a.original_text||''},{onConflict:'agent_id,phone'});
+      if(error)throw error}},
+  async pushArchive(r){const id=await this.sheetId(r,'archived');
+    await this.putLeads(id,r.leads);await this.putAttempts(id,r.attempts)},
+  async markWorking(w){if(w)await this.sheetId(w,'working')},
+  async pushAll(){const w=Store.getWork();if(w)await this.pushWork();
+    for(const r of Store.archives())await this.pushArchive(r)},
+  async pull(){
+    const {data:sheets,error:e1}=await this.client.from('sheets').select('*');if(e1)throw e1;
+    if(!sheets||!sheets.length)return {work:null,attempts:[],archives:[]};
+    const {data:leads,error:e2}=await this.client.from('leads').select('*');if(e2)throw e2;
+    const {data:atts,error:e3}=await this.client.from('contact_attempts').select('*');if(e3)throw e3;
+    const byId={};sheets.forEach(x=>{this.ids[x.sheet_uid]=x.id;byId[x.id]=x});
+    const L={},A={};
+    (leads||[]).forEach(l=>{(L[l.sheet_id]=L[l.sheet_id]||[]).push({key:l.lead_key,db_id:l.db_id,
+      name:l.name||'',phone:l.phone||'',state:l.state||'',email:l.email||'',
+      prev_outcome:l.prev_outcome||'',prev_att:l.prev_att||0,info:l.info||{}})});
+    (atts||[]).forEach(a=>{(A[a.sheet_id]=A[a.sheet_id]||[]).push({attempt_uid:a.attempt_uid,
+      sheet_uid:byId[a.sheet_id]?byId[a.sheet_id].sheet_uid:'',lead_key:a.lead_key,lead_id:a.db_lead_id,
+      phone:a.phone||'',standard_outcome:a.standard_outcome,original_text:a.original_text||'',
+      callback_at:a.callback_at,callback_reason:a.callback_reason||'',logged_at:a.logged_at,
+      source:a.source||'dashboard',schema_version:a.schema_version||4})});
+    const work=s=>({uid:s.sheet_uid,name:s.name,origin:s.origin,created:s.created,leads:L[s.id]||[]});
+    const ws=sheets.find(x=>x.status==='working');
+    const archives=sheets.filter(x=>x.status==='archived')
+      .sort((a,b)=>String(a.archived_at).localeCompare(String(b.archived_at)))
+      .map(x=>({sheet_uid:x.sheet_uid,name:x.name,origin:x.origin,created:x.created,
+                archived_at:x.archived_at,lead_count:(L[x.id]||[]).length,
+                leads:L[x.id]||[],attempts:A[x.id]||[]}));
+    let attempts=[];Object.keys(A).forEach(k=>{attempts=attempts.concat(A[k])});
+    return {work:ws?work(ws):null,attempts,archives}}
+};
+let localOnly=false,authMode='in';
+function syncStatus(){const e=document.getElementById('storeTag'),b=document.getElementById('outBtn');if(!e)return;
+  const txt={off:'Saving to this browser',syncing:'Syncing…',synced:'Synced to your account',
+             error:'Sync failed — your data is safe in this browser'};
+  const cls={off:'chip',syncing:'chip busy',synced:'chip ok',error:'chip bad'};
+  e.textContent=txt[Cloud.state]||txt.off;e.className=cls[Cloud.state]||'chip';
+  e.title=Cloud.note||'';
+  if(b)b.style.display=Cloud.on()?'':'none'}
+function sync(run){if(!Cloud.on())return;Cloud.state='syncing';Cloud.note='';syncStatus();
+  Promise.resolve().then(run).then(()=>{Cloud.state='synced';Cloud.note=''})
+    .catch(e=>{Cloud.state='error';Cloud.note=(e&&e.message)||String(e)})
+    .then(syncStatus)}
+async function firstSync(){
+  const hasLocal=!!Store.getWork()||Store.archives().length>0;
+  try{
+    if(!hasLocal){const d=await Cloud.pull();
+      if(d.work||d.archives.length){
+        Store._s('leo_contact_attempts_v1',d.attempts);Store._s('leo_archives_v1',d.archives);Store.setWork(d.work);
+        Cloud.state='synced';return 'pulled'}}
+    await Cloud.pushAll();Cloud.state='synced';return 'pushed';
+  }catch(e){Cloud.state='error';Cloud.note=(e&&e.message)||String(e);return 'failed'}}
+
+const OUTCOMES=[['VOICEMAIL','Voicemail'],['INSTANT_VOICEMAIL','Instant voicemail'],['NOT_IN_SERVICE','Not in service'],['INTRO_HANGUP','Intro hangup'],['NOT_INTERESTED','Not interested'],['WRONG_NUMBER','Wrong number'],['AI_SCREEN','AI screen'],['ALREADY_COVERED','Already covered'],['CALLBACK','Callback',1],['SOLD_PENDING_APP','Sold, pending app',1]];
+const RETRYCODES=['VOICEMAIL','INSTANT_VOICEMAIL','AI_SCREEN','INTRO_HANGUP'];
+/* days to wait before the next try, by number of attempts already made */
+const WAIT=[1,2,3,5];const MAXTRIES=5;
+const DAY=86400000;
+const nice=c=>c?c.replace(/_/g,' ').toLowerCase():'—';
+const fmtPhone=p=>{const d=String(p||'').replace(/\D/g,'').replace(/^1(?=\d{10}$)/,'');return d.length===10?`(${d.slice(0,3)}) ${d.slice(3,6)}-${d.slice(6)}`:(p||'')};
+const fmtWhen=t=>new Date(t).toLocaleString([],{weekday:'short',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+const fmtDay=t=>{const d=new Date(t),n=new Date();const a=new Date(d.getFullYear(),d.getMonth(),d.getDate()),b=new Date(n.getFullYear(),n.getMonth(),n.getDate());
+  const k=Math.round((a-b)/DAY);return k===0?'today':k===1?'tomorrow':k===-1?'yesterday':k<0?Math.abs(k)+' days ago':'in '+k+' days'};
+const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,7);
+const pad=n=>String(n).padStart(2,'0');
+const localInput=d=>`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+function dueAt(lastAt,tries){const w=WAIT[Math.min(tries,WAIT.length)-1];return new Date(new Date(lastAt).getTime()+w*DAY).toISOString()}
+
+/* ===== tags =====
+   DNC · Callback (due) · Overdue · Scheduled · Fresh · Retry (due) · Waiting · Rested (tries used up) · Done */
+function tagFor(code,cbAt,tries,lastAt,now){
+  now=now||new Date();
+  if(code==='DO_NOT_CALL')return 'DNC';
+  if(!code)return tries>0?'Retry':'Fresh';
+  if(code==='CALLBACK'){if(!cbAt)return 'Callback';const d=new Date(cbAt);
+    return d>now?'Scheduled':(now-d>DAY?'Overdue':'Callback')}
+  if(RETRYCODES.includes(code)){
+    if(tries>=MAXTRIES)return 'Rested';
+    return new Date(dueAt(lastAt,tries))<=now?'Retry':'Waiting'}
+  return 'Done'}
+function queueRows(now){const w=Store.getWork();if(!w)return [];
+  const A=Store.attempts().filter(a=>a.sheet_uid===w.uid),last={},n={};
+  const live={};A.forEach(a=>{const k=a.lead_key,L=live[k]=live[k]||[];
+    if(a.standard_outcome==='REQUEUE'){const v=L.pop();if(v)L.push(Object.assign({},v,{_void:1}));L.push(a)}else L.push(a)});
+  Object.keys(live).forEach(k=>{const L=live[k];last[k]=L[L.length-1];
+    n[k]=L.filter(a=>!a._void&&a.standard_outcome!=='REQUEUE').length});
+  return w.leads.map(l=>{const la=last[l.key],back=la&&la.standard_outcome==='REQUEUE';
+    const code=back?'':(la?la.standard_outcome:l.prev_outcome);
+    const cb=back?null:(la?la.callback_at:null),att=(l.prev_att||0)+(n[l.key]||0),lastAt=la?la.logged_at:'';
+    const tag=back?'Fresh':tagFor(code,cb,att,lastAt,now);
+    return Object.assign({},l,{tag,last:code,cb,why:la?la.callback_reason:'',lastAt,att,
+      due:RETRYCODES.includes(code)&&lastAt?dueAt(lastAt,att):null,note:la?la.original_text:''})})}
+const CALLNOW=['Callback','Overdue','Fresh'];
+let qv='queue',cur='All',sel=null;
+function archiveWork(w){const rec={sheet_uid:w.uid,name:w.name,origin:w.origin,created:w.created,archived_at:new Date().toISOString(),lead_count:w.leads.length,leads:w.leads,attempts:Store.attempts().filter(a=>a.sheet_uid===w.uid)};
+  if(!Store.addArchive(rec)){alert('Your browser is out of storage, so this sheet was NOT archived.\n\nNothing has been lost: your sheet and all its calls are still here. Open the Database tab, download a full backup, then remove an older archived sheet to make room.');return false}Store.setWork(null);sync(()=>Cloud.pushArchive(rec));return true}
+
+/* ---------- sign in ---------- */
+function drawAuth(v){
+  v.innerHTML=` L Welcome to LEO
+   Sign in and your leads, calls and callbacks follow you to any device. Or keep everything on this computer only.
+   
+     
+   
+   `}
+function toggleAuth(){authMode=authMode==='in'?'up':'in';
+  document.getElementById('authTitle').textContent=authMode==='in'?'Sign in':'Create an account';
+  document.getElementById('authGo').textContent=authMode==='in'?'Sign in':'Create account';
+  document.getElementById('authSwap').textContent=authMode==='in'?'Create an account':'I already have an account';
+  document.getElementById('authErr').textContent=''}
+function doAuth(){
+  const em=(document.getElementById('authEmail').value||'').trim(),pw=document.getElementById('authPw').value||'';
+  const err=document.getElementById('authErr');
+  if(!em||!pw){err.textContent='Enter your email and a password.';return}
+  if(authMode==='up'&&pw.length<6){err.textContent='Use at least 6 characters for the password.';return}
+  err.textContent='Working…';
+  (authMode==='in'?Cloud.signIn(em,pw):Cloud.signUp(em,pw))
+    .then(u=>{if(!u){err.textContent='Check your email to confirm the account, then come back and sign in.';return}
+      return firstSync().then(()=>{drawQueue();syncStatus()})})
+    .catch(e=>{err.textContent=(e&&e.message)||'That did not work.'})}
+function useLocalOnly(){localOnly=true;try{localStorage.setItem('leo_local_only','1')}catch(e){}drawQueue();syncStatus()}
+function signOut(){if(!confirm('Sign out? Everything stays in this browser and in your account.'))return;
+  Cloud.signOut().then(()=>{localOnly=false;try{localStorage.removeItem('leo_local_only')}catch(e){}
+    drawQueue();syncStatus()})}
+
+/* ---------- start page ---------- */
+function drawStart(v){const arch=Store.archives().slice().reverse();
+  const leads=arch.reduce((s,r)=>s+r.lead_count,0),calls=arch.reduce((s,r)=>s+r.attempts.length,0);
+  v.innerHTML=` L Good ${new Date().getHours()<12?'morning':new Date().getHours()<18?'afternoon':'evening'}. Ready to dial?
+   Pick up where you left off, or bring in a new sheet. LEO keeps every session exactly as you leave it.
+   
+      ${arch.length>8?` Showing your 8 most recent of ${arch.length}. `:''} `:''}
+    
+   
+   ${arch.length?` ${f(arch.length)}Sheets worked ${f(leads)}Leads on file ${f(calls)}Calls logged `:''}
+  `}
+function resume(id){const arch=Store.archives(),i=arch.findIndex(r=>r.sheet_uid===id);if(i<0)return;
+  const r=arch[i];if(Store.getWork()){toast('Archive the current sheet first');return}
+  if(!Store.setWork({uid:r.sheet_uid,name:r.name,origin:r.origin,created:r.created,leads:r.leads})){alert('Your browser is out of storage, so that sheet could not be opened. Nothing has been lost. Download a full backup from the Database tab, then remove an older archived sheet.');return}
+  arch.splice(i,1);Store.setArchives(arch);qv='queue';cur='All';sel=null;
+  sync(()=>Cloud.markWorking(Store.getWork()));drawQueue();toast('Resumed '+r.name)}
+
+/* ---------- queue ---------- */
+function drawQueue(){const w=Store.getWork(),v=document.getElementById('vQ');
+  if(Cloud.client&&!Cloud.user&&!localOnly){drawAuth(v);return}
+  if(!w){drawStart(v);return}
+  const now=new Date(),R=queueRows(now),c={Callback:0,Overdue:0,Scheduled:0,Fresh:0,Retry:0,Waiting:0,Rested:0,Done:0,DNC:0};R.forEach(r=>c[r.tag]++);
+  const A=Store.attempts().filter(a=>a.sheet_uid===w.uid);
+  const tod=A.filter(a=>new Date(a.logged_at).toDateString()===now.toDateString());
+  const sold=A.filter(a=>a.standard_outcome==='SOLD_PENDING_APP').length;
+  const by={};tod.forEach(a=>by[a.standard_outcome]=(by[a.standard_outcome]||0)+1);
+  const upcoming=R.filter(r=>r.tag==='Scheduled').sort((a,b)=>new Date(a.cb)-new Date(b.cb));
+  const overdue=R.filter(r=>r.tag==='Overdue').sort((a,b)=>new Date(a.cb)-new Date(b.cb));
+  let body,sub,filt='';
+  if(qv==='retry'){
+    const due=R.filter(r=>r.tag==='Retry').sort((a,b)=>String(a.due).localeCompare(String(b.due)));
+    const wait=R.filter(r=>r.tag==='Waiting').sort((a,b)=>String(a.due).localeCompare(String(b.due)));
+    const rest=R.filter(r=>r.tag==='Rested');
+    sub=`Voicemail, instant voicemail, AI screen and intro hangup leads come here on a retry schedule: next day, then 2, 3 and 5 days. After ${MAXTRIES} tries they rest at the bottom.`;
+    const sect=(t,rows,col)=>rows.length?` ${t} (${f(rows.length)}) `+rows.slice(0,200).map(r=>rowHTML(r,col)).join(''):'';
+    body=sect('Due now',due,r=>`${nice(r.last)} · last tried ${fmtDay(r.lastAt)}`)
+      +sect('Waiting',wait,r=>`${nice(r.last)} · due ${fmtDay(r.due)}`)
+      +sect('Resting after '+MAXTRIES+' tries',rest,r=>`${nice(r.last)} · ${r.att} tries`)
+      ||' Nothing on the retry list yet.';
+  }else{
+    const pool=cur==='Done'?R.filter(r=>r.tag==='Done'||r.tag==='DNC'):cur==='Fresh'?R.filter(r=>r.tag==='Fresh'):R.filter(r=>CALLNOW.includes(r.tag));
+    const rows=pool.sort((a,b)=>(CALLNOW.indexOf(a.tag)+1||9)-(CALLNOW.indexOf(b.tag)+1||9)||(a.cb&&b.cb?new Date(a.cb)-new Date(b.cb):a.att-b.att));
+    sub='Overdue callbacks first, then callbacks that are due, then fresh leads. Tap a lead to log the call or see their full info.';
+    filt=` `;
+    body=rows.slice(0,300).map(r=>rowHTML(r,r=>r.cb?`callback set for ${fmtWhen(r.cb)}${r.why?' · '+esc(r.why)+'':''}`:`${nice(r.last)}${r.note?' · '+esc(r.note)+'':''}`)).join('')
+      ||' Nothing in this view.';
+  }
+  v.innerHTML=` ${esc(w.name)} Loaded ${new Date(w.created).toLocaleDateString()} · ${f(w.leads.length)} leads
+   ${pd?'':''}
+  ${f(c.Fresh)}Fresh leads ${f(c.Callback+c.Overdue)}Callbacks due ${f(c.Retry)}Retries due ${f(tod.length)}Calls today ${f(sold)}Sales pending app
+  
+   ${sub}
+   <div id

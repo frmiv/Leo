@@ -305,4 +305,83 @@ function saveCallback(){const v=document.getElementById('cbAt').value;if(!v){ale
   record('CALLBACK',new Date(v).toISOString(),(document.getElementById('cbWhy').value||'').trim())}
 function markDNC(){const w=Store.getWork();const l=w&&w.leads.find(x=>x.key===sel);if(!l)return;
   if(!confirm(`Mark ${l.name||l.phone} as do not call? They leave every calling list for good.`))return;
-  record('DO_NOT_CALL',null,'')}
+  record('DO_NOT_CALL',null,'')}/* ---------- dialing ----------
+   Tap a number to call it. Power dial walks the queue in order and, if switched
+   on, starts the next call as soon as the last one is logged. Leads outside
+   8am-9pm their local time are skipped. Multi-zone states use their main zone. */
+const telNum=p=>{const d=String(p||'').replace(/\D/g,'');return d.length===10?'+1'+d:(d.length===11&&d[0]==='1'?'+'+d:'')};
+const TZ={HI:'Pacific/Honolulu',AK:'America/Anchorage',AZ:'America/Phoenix',IN:'America/Indiana/Indianapolis',MI:'America/Detroit',
+  CA:'America/Los_Angeles',WA:'America/Los_Angeles',OR:'America/Los_Angeles',NV:'America/Los_Angeles',
+  CO:'America/Denver',NM:'America/Denver',UT:'America/Denver',MT:'America/Denver',WY:'America/Denver',ID:'America/Boise',
+  TX:'America/Chicago',OK:'America/Chicago',KS:'America/Chicago',NE:'America/Chicago',SD:'America/Chicago',ND:'America/Chicago',
+  MN:'America/Chicago',IA:'America/Chicago',MO:'America/Chicago',AR:'America/Chicago',LA:'America/Chicago',MS:'America/Chicago',
+  AL:'America/Chicago',TN:'America/Chicago',WI:'America/Chicago',IL:'America/Chicago'};
+const tzFor=s=>s?(TZ[s]||'America/New_York'):null;
+function theirTime(state,now){const z=tzFor(state);if(!z)return null;now=now||new Date();
+  try{const h=+new Intl.DateTimeFormat('en-US',{timeZone:z,hour:'numeric',hourCycle:'h23'}).format(now)%24;
+    return {h,ok:h>=8&&h<21,label:now.toLocaleTimeString('en-US',{timeZone:z,hour:'numeric',minute:'2-digit'})}}catch(e){return null}}
+const okHours=(s,now)=>{const t=theirTime(s,now);return !t||t.ok};
+let pd=false,autoDial=false;try{autoDial=localStorage.getItem('leo_autodial')==='1'}catch(e){}
+const PDORDER=['Overdue','Callback','Fresh','Retry'];
+function pdList(now){now=now||new Date();return queueRows(now).filter(r=>PDORDER.includes(r.tag)&&okHours(r.state,now))
+  .sort((a,b)=>PDORDER.indexOf(a.tag)-PDORDER.indexOf(b.tag)||(a.cb&&b.cb?new Date(a.cb)-new Date(b.cb):a.att-b.att))}
+function dial(phone){const t=telNum(phone);if(!t)return false;try{window.location.href='tel:'+t;return true}catch(e){return false}}
+function callLead(k){const w=Store.getWork(),l=w&&w.leads.find(x=>x.key===k);if(!l)return;sel=k;drawQueue();dial(l.phone)}
+function startPD(){const L=pdList();if(!L.length){toast('Nobody to call right now');return}
+  pd=true;qv='queue';sel=L[0].key;drawQueue();if(autoDial)dial(L[0].phone)}
+function stopPD(){pd=false;sel=null;drawQueue()}
+function setAutoDial(on){autoDial=!!on;try{localStorage.setItem('leo_autodial',on?'1':'0')}catch(e){}}
+function pdAdvance(done){if(!pd)return false;const nx=pdList().find(r=>r.key!==done);
+  if(!nx){pd=false;sel=null;drawQueue();toast('Power dial finished. Nobody left to call right now.');return true}
+  sel=nx.key;drawQueue();if(autoDial)dial(nx.phone);return true}
+function pdBar(){const n=pdList().length;return ` `}
+/* ---------- send back to Fresh ----------
+   For a mis-tapped outcome. Adds a REQUEUE row that cancels the call before it,
+   so the lead shows as Fresh again and that call no longer counts toward its tries.
+   Nothing is deleted. Both rows stay in the history and the export. */
+function canSendBack(r){const w=Store.getWork();if(!w||!r)return false;
+  if(['DNC','Fresh'].includes(r.tag)||r.last==='SOLD_PENDING_APP')return false;
+  return Store.attempts().some(a=>a.sheet_uid===w.uid&&a.lead_key===r.key)}
+function sendBack(k){const w=Store.getWork();k=k||sel;const l=w&&w.leads.find(x=>x.key===k);if(!l)return;
+  const r=queueRows().find(x=>x.key===k);if(!canSendBack(r)){toast('That lead can\u2019t be sent back');return}
+  const a=Store.addAttempt({attempt_uid:'web-'+uid(),sheet_uid:w.uid,lead_key:l.key,lead_id:l.db_id??null,phone:l.phone,
+    standard_outcome:'REQUEUE',original_text:'Sent back to Fresh (undid: '+nice(r.last)+')',callback_at:null,callback_reason:'',
+    logged_at:new Date().toISOString(),source:'dashboard',schema_version:4});
+  if(!a){alert('Your browser is out of storage, so this was NOT saved. Download a backup from the Database tab and free some room.');return}
+  sync(()=>Cloud.pushAttempt(a));
+  if(sel===k)sel=null;drawQueue();toast((l.name||l.phone)+' is back on the Fresh list')}
+/* ---------- full info ---------- */
+function showInfo(l,sheetName,attempts){
+  const base=[['Name',l.name],['Phone',l.phone],['State',l.state],['Email',l.email]].filter(x=>x[1]);
+  const extra=Object.entries(l.info||{}),H=attempts.filter(a=>a.lead_key===l.key);
+  document.getElementById('infoBox').innerHTML=` ${esc(l.name)||'No name on file'} ${esc(sheetName)}
+   Contact ${base.map(([k,v])=>` ${esc(k)} ${esc(v)} `).join('')}
+   Everything on the original sheet ${extra.length?` ${extra.map(([k,v])=>` ${esc(k)} ${esc(v)} `).join('')} `:' No extra details saved. Leads imported before the full-info update need re-importing to show every column.'}
+   Call history ${H.length?H.slice().reverse().map(a=>` ${nice(a.standard_outcome)}${a.callback_at?' · set for '+fmtWhen(a.callback_at):''}${a.callback_reason?' · '+esc(a.callback_reason):''}${a.original_text?' · '+esc(a.original_text):''}${new Date(a.logged_at).toLocaleString()} `).join(''):' No calls logged yet.'}
+   `;
+  document.getElementById('infoM').classList.add('on')}
+function closeInfo(){document.getElementById('infoM').classList.remove('on')}
+function infoWork(k){const w=Store.getWork();const l=w&&w.leads.find(x=>x.key===k);if(l)showInfo(l,w.name,Store.attempts().filter(a=>a.sheet_uid===w.uid))}
+let ALL=[];
+function buildAll(){ALL=[];const w=Store.getWork();
+  if(w){const A=Store.attempts().filter(a=>a.sheet_uid===w.uid);w.leads.forEach(l=>ALL.push({l,sheet:w.name+' (current)',A}))}
+  Store.archives().slice().reverse().forEach(r=>r.leads.forEach(l=>ALL.push({l,sheet:r.name,A:r.attempts})))}
+function infoAll(i){const x=ALL[i];if(x)showInfo(x.l,x.sheet,x.A)}
+function drawAllList(){const el=document.getElementById('allSearch'),q=el?el.value.toLowerCase():'';
+  const m=ALL.map((x,i)=>({x,i})).filter(({x})=>!q||[x.l.name,x.l.phone,x.l.state,x.l.email,x.sheet].join(' ').toLowerCase().includes(q));
+  document.getElementById('allBody').innerHTML=m.slice(0,300).map(({x,i})=>` ${esc(x.l.name)||'No name'} ${esc(x.l.phone)} ${esc(x.l.state)||'—'} ${esc(x.sheet)} `).join('')||' No leads yet. Import a sheet to start.';
+  document.getElementById('allCount').textContent=m.length>300?`Showing 300 of ${f(m.length)}. Search to narrow down.`:`${f(m.length)} leads`}
+function startSheet(name,origin,leads){if(!Store.setWork({uid:'sheet-'+uid(),name,origin,created:new Date().toISOString(),leads})){alert('Your browser is out of storage, so that sheet could not be loaded. Open the Database tab, download a full backup, then remove an older archived sheet to make room.');return false}qv='queue';cur='All';sel=null;tab('Q');sync(()=>Cloud.pushWork());toast(`Loaded ${leads.length} leads`);return true}
+function archive(){const w=Store.getWork();if(!w)return;if(!confirm(`Archive "${w.name}"? Its leads and calls are kept, and you can resume it from the start page.`))return;if(!archiveWork(w)){drawQueue();return}sel=null;drawQueue();toast('Sheet archived')}
+/* ---------- import ---------- */
+function parseCSV(t){const rows=[];let r=[],v='',q=false;
+  for(let i=0;i<t.length;i++){const ch=t[i];
+    if(q){if(ch==='"'){if(t[i+1]==='"'){v+='"';i++}else q=false}else v+=ch}
+    else if(ch==='"')q=true;else if(ch===','){r.push(v);v=''}
+    else if(ch==='\n'||ch==='\r'){if(ch==='\r'&&t[i+1]==='\n')i++;r.push(v);rows.push(r);r=[];v=''}
+    else v+=ch}
+  if(v!==''||r.length){r.push(v);rows.push(r)}return rows.filter(x=>x.some(c=>String(c).trim()!==''))}
+const STATES='AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC'.split(' ');
+const STNAME={alabama:'AL',alaska:'AK',arizona:'AZ',arkansas:'AR',california:'CA',colorado:'CO',connecticut:'CT',delaware:'DE',florida:'FL',georgia:'GA',hawaii:'HI',idaho:'ID',illinois:'IL',indiana:'IN',iowa:'IA',kansas:'KS',kentucky:'KY',louisiana:'LA',maine:'ME',maryland:'MD',massachusetts:'MA',michigan:'MI',minnesota:'MN',mississippi:'MS',missouri:'MO',montana:'MT',nebraska:'NE',nevada:'NV','new hampshire':'NH','new jersey':'NJ','new mexico':'NM','new york':'NY','north carolina':'NC','north dakota':'ND',ohio:'OH',oklahoma:'OK',oregon:'OR',pennsylvania:'PA','rhode island':'RI','south carolina':'SC','south dakota':'SD',tennessee:'TN',texas:'TX',utah:'UT',vermont:'VT',virginia:'VA',washington:'WA','west virginia':'WV',wisconsin:'WI',wyoming:'WY'};
+const toState=s=>{s=String(s||'').trim();return STATES.includes(s.toUpperCase())?s.toUpperCase():(STNAME[s.toLowerCase()]||'')};
+const isPhone=s=>{const d=String(s||'').replace(/\D/g,'');return d.length===10||(d.length===11&&d[0]==='1')};

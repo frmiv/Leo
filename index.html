@@ -384,4 +384,79 @@ function parseCSV(t){const rows=[];let r=[],v='',q=false;
 const STATES='AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC'.split(' ');
 const STNAME={alabama:'AL',alaska:'AK',arizona:'AZ',arkansas:'AR',california:'CA',colorado:'CO',connecticut:'CT',delaware:'DE',florida:'FL',georgia:'GA',hawaii:'HI',idaho:'ID',illinois:'IL',indiana:'IN',iowa:'IA',kansas:'KS',kentucky:'KY',louisiana:'LA',maine:'ME',maryland:'MD',massachusetts:'MA',michigan:'MI',minnesota:'MN',mississippi:'MS',missouri:'MO',montana:'MT',nebraska:'NE',nevada:'NV','new hampshire':'NH','new jersey':'NJ','new mexico':'NM','new york':'NY','north carolina':'NC','north dakota':'ND',ohio:'OH',oklahoma:'OK',oregon:'OR',pennsylvania:'PA','rhode island':'RI','south carolina':'SC','south dakota':'SD',tennessee:'TN',texas:'TX',utah:'UT',vermont:'VT',virginia:'VA',washington:'WA','west virginia':'WV',wisconsin:'WI',wyoming:'WY'};
 const toState=s=>{s=String(s||'').trim();return STATES.includes(s.toUpperCase())?s.toUpperCase():(STNAME[s.toLowerCase()]||'')};
-const isPhone=s=>{const d=String(s||'').replace(/\D/g,'');return d.length===10||(d.length===11&&d[0]==='1')};
+const isPhone=s=>{const d=String(s||'').replace(/\D/g,'');return d.length===10||(d.length===11&&d[0]==='1')};function rowsToLeads(rows){if(!rows.length)return {leads:[],note:'The file is empty.'};
+  const hdr=rows[0].map(h=>String(h).toLowerCase().trim()),hasHdr=!rows[0].some(isPhone);
+  const body=hasHdr?rows.slice(1):rows,ncol=Math.max(...rows.map(r=>r.length));
+  const names=[];for(let c=0;c<ncol;c++){const h=hasHdr?String(rows[0][c]??'').trim():'';names.push(h||'Column '+(c+1))}
+  const find=re=>hasHdr?hdr.findIndex(h=>re.test(h)):-1;
+  const score=fn=>{let best=-1,bs=0;for(let c=0;c<ncol;c++){const s=body.slice(0,200).filter(r=>fn(r[c])).length;if(s>bs){bs=s;best=c}}return best};
+  let ph=find(/phone|mobile|cell|number/);if(ph<0||!body.slice(0,50).some(r=>isPhone(r[ph])))ph=score(isPhone);
+  let stc=find(/state/);if(stc<0)stc=score(v=>toState(v)!=='');
+  const fn=find(/first/),ln=find(/last/);let nm=find(/^name$|full ?name|^client|^lead/);
+  if(nm<0&&fn<0)nm=score(v=>/^[A-Za-z][A-Za-z'.-]+( [A-Za-z'.-]+)+$/.test(String(v||'').trim()));
+  const em=find(/e-?mail/);if(ph<0)return {leads:[],note:'No phone number column found.'};
+  const seen=new Set(),leads=[];let dup=0,nophone=0;
+  body.forEach((r,i)=>{if(!isPhone(r[ph])){nophone++;return}const p=fmtPhone(r[ph]);if(seen.has(p))dup++;seen.add(p);
+    const name=(fn>=0?[r[fn],ln>=0?r[ln]:''].join(' '):(nm>=0?r[nm]:'')).trim().replace(/\s+/g,' ');
+    const info={};names.forEach((h,c)=>{const v=String(r[c]??'').trim();if(v){let k=h,n=2;while(k in info)k=h+' ('+(n++)+')';info[k]=v}});
+    leads.push({key:'f'+i,db_id:null,name,phone:p,state:stc>=0?toState(r[stc]):'',email:em>=0?String(r[em]||'').trim():'',prev_outcome:'',prev_att:0,info})});
+  return {leads,note:`${leads.length} leads imported.`+(nophone?` ${nophone} rows had no usable phone and were skipped.`:'')+(dup?` ${dup} repeated phone numbers are kept and flagged for review.`:'')}}
+function importFile(file){if(!file)return;const name=file.name.replace(/\.(csv|xlsx|xls)$/i,'');
+  const go=rows=>{const res=rowsToLeads(rows);if(!res.leads.length){alert('Could not import: '+res.note);return}
+    if(Store.getWork()&&!confirm('A sheet is already loaded. Press OK to archive it and load the new file.'))return;if(Store.getWork()&&!archiveWork(Store.getWork()))return;
+    if(!startSheet(name,'file',res.leads))return;setTimeout(()=>alert(res.note),50)};
+  if(/\.csv$/i.test(file.name)){const rd=new FileReader();rd.onload=()=>go(parseCSV(rd.result));rd.readAsText(file);return}
+  const withX=()=>{const rd=new FileReader();rd.onload=()=>{const wb=XLSX.read(rd.result,{type:'array'});go(XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,defval:''}))};rd.readAsArrayBuffer(file)};
+  if(window.XLSX)return withX();const s=document.createElement('script');s.src='https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
+  s.onload=withX;s.onerror=()=>alert('Excel files need internet. Save as CSV and import that instead.');document.head.appendChild(s)}
+/* ---------- export ---------- */
+function csvDownload(rows,name){const csv=rows.map(r=>r.map(v=>'"'+String(v??'').replace(/"/g,'""')+'"').join(',')).join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download=name;a.click()}
+const HDR=['attempt_uid','sheet','lead_id','name','phone','standard_outcome','original_text','callback_at','callback_reason','logged_at','source','schema_version'];
+function attemptRows(A,leads,sheet){const m={};leads.forEach(l=>m[l.key]=l);return A.map(a=>[a.attempt_uid,sheet,a.lead_id??'',(m[a.lead_key]||{}).name||'',a.phone,a.standard_outcome,a.original_text,a.callback_at||'',a.callback_reason||'',a.logged_at,a.source,a.schema_version])}
+function exportSheet(){const w=Store.getWork();if(!w)return;const A=Store.attempts().filter(a=>a.sheet_uid===w.uid);if(!A.length){toast('No calls logged yet');return}csvDownload([HDR,...attemptRows(A,w.leads,w.name)],'LEO_calls_'+w.name.replace(/\W+/g,'_')+'.csv')}
+function downloadBackup(){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(Store.backup())],{type:'application/json'}));
+  a.download='LEO_backup_'+new Date().toISOString().slice(0,10)+'.json';a.click();toast('Backup downloaded')}
+function restoreBackup(file){if(!file)return;const rd=new FileReader();
+  rd.onload=()=>{let b;try{b=JSON.parse(rd.result)}catch(e){alert('That file is not a LEO backup.');return}
+    const c=(b.attempts||[]).length,n=(b.archives||[]).length;
+    if(!confirm('Restore this backup? Everything now in LEO is replaced by '+c+' logged call(s) and '+n+' archived sheet(s).'))return;
+    const err=Store.restore(b);if(err){alert(err);return}
+    sel=null;qv='queue';cur='All';sync(()=>Cloud.pushAll());drawQueue();drawDB();toast('Backup restored')};
+  rd.readAsText(file)}
+function exportAll(){const rows=[HDR];Store.archives().forEach(r=>rows.push(...attemptRows(r.attempts,r.leads,r.name)));const w=Store.getWork();if(w)rows.push(...attemptRows(Store.attempts().filter(a=>a.sheet_uid===w.uid),w.leads,w.name));if(rows.length<2){toast('No logged calls yet');return}csvDownload(rows,'LEO_all_calls.csv')}
+/* ---------- database tab ---------- */
+function drawDB(){buildAll();const arch=Store.archives(),archCalls=arch.reduce((s,r)=>s+r.attempts.length,0);
+  const oc={};arch.forEach(r=>r.attempts.forEach(a=>oc[a.standard_outcome]=(oc[a.standard_outcome]||0)+1));
+  const w=Store.getWork();if(w)Store.attempts().filter(a=>a.sheet_uid===w.uid).forEach(a=>oc[a.standard_outcome]=(oc[a.standard_outcome]||0)+1);
+  const os=Object.entries(oc).sort((a,b)=>b[1]-a[1]),om=os.length?os[0][1]:1;
+  document.getElementById('vD').innerHTML=` Database Every lead you've loaded, plus your archived calling sessions. ${Cloud.on()?``:''}
+  ${f(ALL.length)}All leads ${f(arch.length)}Archived sheets ${f(archCalls)}Archived calls ${f(oc.SOLD_PENDING_APP||0)}Sales pending app ${f(oc.DO_NOT_CALL||0)}Do not call
+  
+  Archived sheets Resume any of these from the start page. ${arch.length?arch.slice().reverse().map(r=>` ${esc(r.name)} · ${r.lead_count} leads · ${r.attempts.length} calls${new Date(r.archived_at).toLocaleDateString()} `).join(''):' Nothing archived yet'}
+  Where your data lives ${Cloud.on()?'Signed in as '+esc(Cloud.user.email||'your account')+'. Everything below is mirrored to your account, so it reaches any device you sign in on. This browser keeps its own copy too, so LEO still works offline.':'This browser only. Sign in to reach your leads from another device.'}
+   ${Cloud.state==='error'?` Last sync failed: ${esc(Cloud.note)}. Nothing has been lost — your data is in this browser. Press Sync now to try again. `:''}
+   This browser Roughly 5 MB of room. Download a backup regularly.
+   ${(()=>{const kb=Math.round(Store.bytes()/1024),pct=Math.min(100,Math.round(kb/5120*100));
+     return ` ${f(kb)} KB used${pct}% of about 5 MB `+
+      (pct>=70?` Running low. Download a full backup and remove an older archived sheet. `:'')})()}
+   
+  Call outcomes Everything logged so far ${os.map(o=>` ${nice(o[0])}${f(o[1])} `).join('')||' No outcomes yet'} `;
+  drawAllList()}
+function tab(t){['Q','D'].forEach(x=>{document.getElementById('tab'+x).classList.toggle('on',x===t);document.getElementById('v'+x).classList.toggle('on',x===t)});if(t==='D')drawDB();else drawQueue()}
+let toastT=0;
+function toast(t,undo){const e=document.getElementById('toast');
+  if(undo){e.innerHTML=esc(t)+` `;e.style.pointerEvents='auto'}
+  else{e.textContent=t;e.style.pointerEvents=''}
+  e.classList.add('on');clearTimeout(toastT);toastT=setTimeout(()=>e.classList.remove('on'),undo?7000:2600)}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeInfo()});
+/* re-check every minute so due callbacks and retries rise up */
+setInterval(()=>{if(!sel&&document.getElementById('vQ').classList.contains('on')&&!document.getElementById('infoM').classList.contains('on'))drawQueue()},60000);
+try{localOnly=localStorage.getItem('leo_local_only')==='1'}catch(e){localOnly=false}
+drawQueue();syncStatus();
+(function(){const sc=document.createElement('script');
+  sc.src='https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js';
+  sc.onload=()=>{Cloud.start();Cloud.session()
+    .then(u=>u?firstSync():null)
+    .then(()=>{drawQueue();syncStatus()})};
+  sc.onerror=()=>{Cloud.state='off';syncStatus()};
+  document.head.appendChild(sc)})();

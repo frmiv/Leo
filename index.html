@@ -3,9 +3,7 @@
 
 
 <input type="file" id="file" accept=".csv,.xlsx,.xls" style="display:none" onchange="importFile(this.files[0]);this.value=''">
-<input type="file" id="bfile" accept=".json,application/json" style="display:none" onchange="restoreBackup(this.files[0]);this.value=''">
-
-<script>
+<input type="file" id="bfile" accept=".json,application/json" style="display:none" onchange="restoreBackup(this.files[0]);this.value=''"><script>
 const f=n=>Number(n).toLocaleString();
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 /* ===== STORAGE LAYER — the only code that touches storage.
